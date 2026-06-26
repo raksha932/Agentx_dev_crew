@@ -1,187 +1,278 @@
+"""
+Google Gemini API Client with lazy initialization.
+Handles API key validation and provides methods for code analysis.
+"""
+
 import os
-import json
-import asyncio
 import logging
-from typing import Any, Optional, AsyncGenerator
-from google import genai
-from google.genai import types
-from google.api_core import retry
-from google.api_core.exceptions import ResourceExhausted, GoogleAPIError
-from pydantic import BaseModel
-import time
+from typing import Optional, Dict, Any
+import json
+import re
+from datetime import datetime
+
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 
-class GeminiResponse(BaseModel):
-    content: str
-    structured_data: Optional[dict] = None
-    tokens_used: int = 0
-    model: str
-
-
 class GeminiClient:
-    """Async Gemini client with retry and rate limit handling."""
+    """Client for interacting with Google Gemini API."""
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        model: str = "gemini-2.5-flash",
-        max_retries: int = 3,
-        retry_delay: float = 1.0,
-    ):
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        if not self.api_key:
-            raise ValueError("GEMINI_API_KEY is required")
-
-        self.model_name = model
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-
-        self.client = genai.Client(api_key=self.api_key)
-
-        self._rate_limit_semaphore = asyncio.Semaphore(10)
-        self._last_request_time = 0
-        self._min_request_interval = 0.1
-
-    async def _wait_for_rate_limit(self):
-        async with self._rate_limit_semaphore:
-            elapsed = time.time() - self._last_request_time
-            if elapsed < self._min_request_interval:
-                await asyncio.sleep(self._min_request_interval - elapsed)
-            self._last_request_time = time.time()
-
-    def _get_retry_policy(self) -> retry.Retry:
-        return retry.Retry(
-            predicate=lambda exc: isinstance(exc, (ResourceExhausted, GoogleAPIError)),
-            initial=self.retry_delay,
-            maximum=60.0,
-            multiplier=2.0,
-        )
-
-    async def generate(
-        self,
-        prompt: str,
-        system_instruction: Optional[str] = None,
-        temperature: float = 0.7,
-        max_output_tokens: int = 8192,
-        response_schema: Optional[dict] = None,
-    ) -> GeminiResponse:
-        """Generate a response from Gemini."""
-        await self._wait_for_rate_limit()
-
-        config = types.GenerateContentConfig(
-            temperature=temperature,
-            max_output_tokens=max_output_tokens,
-        )
-
-        if system_instruction:
-            config.system_instruction = system_instruction
-
-        if response_schema:
-            config.response_schema = response_schema
-            config.response_mime_type = "application/json"
-
-        retries = 0
-        last_error = None
-
-        while retries < self.max_retries:
-            try:
-                response = await asyncio.to_thread(
-                    lambda: self.client.models.generate_content(
-                        model=self.model_name,
-                        contents=prompt,
-                        config=config,
-                    )
-                )
-
-                content = response.text
-
-                structured_data = None
-                if response_schema:
-                    try:
-                        structured_data = json.loads(content)
-                    except json.JSONDecodeError:
-                        logger.warning("Failed to parse JSON response")
-
-                usage = response.usage_metadata or {}
-                tokens_used = getattr(usage, "total_token_count", 0)
-
-                return GeminiResponse(
-                    content=content,
-                    structured_data=structured_data,
-                    tokens_used=tokens_used,
-                    model=self.model_name,
-                )
-
-            except ResourceExhausted as e:
-                last_error = e
-                retries += 1
-                wait_time = self.retry_delay * (2**retries)
-                logger.warning(f"Rate limited, waiting {wait_time}s before retry {retries}")
-                await asyncio.sleep(wait_time)
-
-            except GoogleAPIError as e:
-                last_error = e
-                retries += 1
-                wait_time = self.retry_delay * (2**retries)
-                logger.error(f"API error: {e}, retrying {retries}/{self.max_retries}")
-                await asyncio.sleep(wait_time)
-
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}")
-                raise
-
-        raise Exception(f"Failed after {self.max_retries} retries: {last_error}")
-
-    async def generate_structured(
-        self,
-        prompt: str,
-        schema: dict,
-        system_instruction: Optional[str] = None,
-        temperature: float = 0.3,
-    ) -> dict:
-        """Generate a structured JSON response."""
-        response = await self.generate(
-            prompt=prompt,
-            system_instruction=system_instruction,
-            temperature=temperature,
-            response_schema=schema,
-        )
-        return response.structured_data or {}
-
-    async def generate_stream(
-        self,
-        prompt: str,
-        system_instruction: Optional[str] = None,
-        temperature: float = 0.7,
-    ) -> AsyncGenerator[str, None]:
-        """Generate a streaming response."""
-        await self._wait_for_rate_limit()
-
-        config = types.GenerateContentConfig(
-            temperature=temperature,
-        )
-
-        if system_instruction:
-            config.system_instruction = system_instruction
-
-        try:
-            stream = await asyncio.to_thread(
-                lambda: self.client.models.generate_content_stream(
-                    model=self.model_name,
-                    contents=prompt,
-                    config=config,
-                )
+    def __init__(self):
+        """Initialize the Gemini client with API key from environment."""
+        api_key = os.getenv("GEMINI_API_KEY")
+        
+        if not api_key:
+            raise ValueError(
+                "GEMINI_API_KEY is required. "
+                "Please set it in your .env file or environment variables. "
+                "Get your key at: https://makersuite.google.com/app/apikey"
             )
 
-            for chunk in stream:
-                if chunk.text:
-                    yield chunk.text
+        try:
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-pro')
+            logger.info("✓ Gemini client initialized successfully")
+        except Exception as e:
+            logger.error(f"✗ Failed to configure Gemini: {str(e)}")
+            raise ValueError(f"Invalid GEMINI_API_KEY: {str(e)}")
+
+    async def analyze_code(
+        self, 
+        code: str, 
+        file_path: str = None,
+        language: str = None
+    ) -> Dict[str, Any]:
+        """
+        Analyze code for security, quality, and performance issues.
+        
+        Args:
+            code: The code to analyze
+            file_path: Path to the file being analyzed
+            language: Programming language (auto-detect if not provided)
+        
+        Returns:
+            Dictionary with issues and analysis summary
+        """
+        file_info = f"File: {file_path}" if file_path else "Unknown file"
+        
+        prompt = f"""You are an expert code reviewer. Analyze the following code and identify issues.
+
+{file_info}
+
+Code to analyze:
+```
+{code}
+```
+
+Analyze and find:
+1. **Security vulnerabilities** (SQL injection, XSS, authentication issues, etc.)
+2. **Code quality issues** (naming, structure, duplication, etc.)
+3. **Performance problems** (inefficient loops, N+1 queries, memory leaks, etc.)
+4. **Best practice violations** (error handling, type hints, documentation, etc.)
+
+Return ONLY valid JSON (no other text):
+{{
+    "issues": [
+        {{
+            "type": "security|quality|performance|best_practice",
+            "severity": "critical|high|medium|low",
+            "title": "Brief issue title",
+            "description": "Detailed explanation of the issue",
+            "line_number": 10,
+            "suggested_fix": "How to fix this issue"
+        }}
+    ],
+    "summary": "Overall assessment of code quality",
+    "total_issues": 0
+}}
+
+If no issues found, return: {{"issues": [], "summary": "No issues found", "total_issues": 0}}
+"""
+
+        try:
+            response = self.model.generate_content(prompt, safety_settings=[
+                {
+                    "category": "HARM_CATEGORY_UNSPECIFIED",
+                    "threshold": "BLOCK_NONE",
+                },
+            ])
+            
+            # Extract JSON from response
+            text = response.text
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            
+            if json_match:
+                try:
+                    result = json.loads(json_match.group())
+                    logger.info(f"✓ Analyzed {file_path}: {result.get('total_issues', len(result.get('issues', [])))} issues found")
+                    return result
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse Gemini response for {file_path}")
+                    return {
+                        "issues": [],
+                        "summary": "Failed to parse analysis response",
+                        "total_issues": 0
+                    }
+            
+            return {
+                "issues": [],
+                "summary": "No structured response from Gemini",
+                "total_issues": 0
+            }
 
         except Exception as e:
-            logger.error(f"Streaming error: {e}")
-            raise
+            logger.error(f"✗ Error analyzing code ({file_path}): {str(e)}")
+            return {
+                "issues": [],
+                "summary": f"Analysis error: {str(e)}",
+                "total_issues": 0
+            }
+
+    async def generate_fix(self, issue: Dict[str, Any], code: str) -> str:
+        """
+        Generate a fix for the identified issue.
+        
+        Args:
+            issue: Issue dictionary with details
+            code: Original code that needs fixing
+        
+        Returns:
+            Fixed code as string
+        """
+        issue_title = issue.get('title', 'Unknown issue')
+        issue_desc = issue.get('description', '')
+        suggested = issue.get('suggested_fix', '')
+
+        prompt = f"""Generate a code fix for this issue:
+
+Issue: {issue_title}
+Description: {issue_desc}
+Suggested approach: {suggested}
+
+Original code:
+```
+{code}
+```
+
+Return ONLY the corrected/fixed code. No explanation, no markdown, just the code."""
+
+        try:
+            response = self.model.generate_content(prompt)
+            fixed_code = response.text.strip()
+            
+            # Remove markdown code blocks if present
+            fixed_code = re.sub(r'^```[\w]*\n?', '', fixed_code)
+            fixed_code = re.sub(r'\n?```$', '', fixed_code)
+            
+            logger.info(f"✓ Generated fix for: {issue_title}")
+            return fixed_code
+
+        except Exception as e:
+            logger.error(f"✗ Error generating fix for {issue_title}: {str(e)}")
+            return ""
+
+    async def summarize_code(self, code: str, file_path: str = None) -> str:
+        """
+        Generate a summary of what the code does.
+        
+        Args:
+            code: Code to summarize
+            file_path: Path to the file
+        
+        Returns:
+            Summary as string
+        """
+        file_info = f"File: {file_path}" if file_path else ""
+
+        prompt = f"""Summarize what this code does in 2-3 sentences:
+
+{file_info}
+
+```
+{code}
+```"""
+
+        try:
+            response = self.model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"✗ Error summarizing code: {str(e)}")
+            return ""
+
+    async def explain_code(self, code: str, file_path: str = None) -> str:
+        """
+        Provide detailed explanation of code functionality.
+        
+        Args:
+            code: Code to explain
+            file_path: Path to the file
+        
+        Returns:
+            Detailed explanation
+        """
+        file_info = f"File: {file_path}" if file_path else ""
+
+        prompt = f"""Explain this code in detail:
+
+{file_info}
+
+```
+{code}
+```
+
+Include:
+1. What it does
+2. Key functions/methods
+3. How it works
+4. Dependencies"""
+
+        try:
+            response = self.model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"✗ Error explaining code: {str(e)}")
+            return ""
 
 
-gemini_client = GeminiClient()
+# Lazy initialization - Don't create client on module import
+_gemini_client: Optional[GeminiClient] = None
+
+
+def get_gemini_client() -> GeminiClient:
+    """
+    Get or create the Gemini client (lazy initialization).
+    This prevents errors if GEMINI_API_KEY is not immediately available.
+    
+    Returns:
+        GeminiClient instance
+    
+    Raises:
+        ValueError: If GEMINI_API_KEY is not set
+    """
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = GeminiClient()
+    return _gemini_client
+
+
+def reset_gemini_client():
+    """Reset the Gemini client (useful for testing)."""
+    global _gemini_client
+    _gemini_client = None
+
+
+# For backwards compatibility with old code
+# This allows: from core.gemini_client import gemini_client
+# But the client will be created on first use, not on import
+class _LazyGeminiClient:
+    def __getattr__(self, name):
+        client = get_gemini_client()
+        return getattr(client, name)
+
+
+gemini_client = _LazyGeminiClient()
